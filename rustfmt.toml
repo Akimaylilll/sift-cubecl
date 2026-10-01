@@ -1,0 +1,17 @@
+# .rustfmt.toml —— 团队统一格式化配置
+
+# 行宽：100 字符，适合绝大部分屏幕
+max_width = 100
+
+# 缩进：4 个空格，不用 Tab
+hard_tabs = false
+tab_spaces = 4
+
+# 导入语句自动排序
+reorder_imports = true
+
+# 删除不必要的括号（比如 `(x)` 变成 `x`）
+remove_nested_parens = true
+
+# 换行符：统一用 Unix 格式，避免 Windows 的 \r\n 污染
+newline_style = "Unix"

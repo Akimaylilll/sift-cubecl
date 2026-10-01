@@ -1,0 +1,8 @@
+# 认知复杂度阈值，默认25[reference:8]。值越低，鼓励函数越简单
+cognitive-complexity-threshold = 25
+# 函数最大行数，默认100[reference:9]
+too-many-lines-threshold = 100
+# 函数参数过多阈值，默认7[reference:10]
+too-many-arguments-threshold = 7
+# 类型复杂度过高阈值，默认250[reference:11][reference:12]
+type-complexity-threshold = 250

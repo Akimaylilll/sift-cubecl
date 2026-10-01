@@ -1,0 +1,26 @@
+[package]
+name = "sift-cubecl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cubecl = "0.10.0"
+image = "0.25.5"
+imageproc = "0.25.0"
+nalgebra = "0.33.2"
+ndarray = "0.16.1"
+
+[features]
+default = ["wgpu"]
+cpu = ["cubecl/cpu"]
+cuda = ["cubecl/cuda"]
+wgpu = ["cubecl/wgpu"]
+
+[[example]]
+name = "test"
+path = "examples/test.rs"
+
+[lints.clippy]
+all = "warn"               # 所有默认启用的 lint
+correctness = "deny"       # 将正确性相关的 lint 升级为错误
+
