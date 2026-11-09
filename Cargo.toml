@@ -10,6 +10,9 @@ imageproc = "0.25.0"
 nalgebra = "0.33.2"
 ndarray = "0.16.1"
 
+[dev-dependencies]
+minifb = "0.24"
+
 [features]
 default = ["wgpu"]
 cpu = ["cubecl/cpu"]

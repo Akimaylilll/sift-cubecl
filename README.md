@@ -129,12 +129,12 @@ fn main() {
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `max_num_features` | `0` | 最多保留关键点数，`0` 表示不限制 |
-| `first_octave` | `0` | 首个 octave 索引，`-1` 表示先上采样 2x |
+| `first_octave` | `0` | 首个 octave 索引（`-1` 先上采样 2x；会写入 `KeyPoint.first_octave` 并参与尺度/坐标换算） |
 | `num_octaves` | `0` | octave 数，`0` 表示按图像尺寸自动 |
 | `octave_resolution` | `3` | 每个 octave 的尺度数 |
-| `peak_threshold` | `0.04` | 极值响应阈值（越小检测越多） |
+| `peak_threshold` | `0.04` | 归一化对比度阈值（同 OpenCV `contrastThreshold`，越小检测越多） |
 | `edge_threshold` | `10.0` | 边缘响应剔除阈值 |
-| `normalization` | `L1` | 描述符归一化：`Normalization::L1` / `L2` |
+| `normalization` | `L2` | 描述符归一化（同 OpenCV）：`Normalization::L2`（截断 0.2 + 二次归一化）/ `L1` |
 
 ### `KeyPoint`
 

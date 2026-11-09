@@ -130,7 +130,11 @@ fn compute_orientation_histogram(
         let octave_scale = kp_octave_scale[kp_idx];
         let scale_idx = usize::cast_from(kp_scale_idx[kp_idx]);
 
-        let sigma = gaussian_sigma_factor * scale;
+        // `scale` 是原图坐标下的 sigma，而梯度金字塔以各 octave 自身的分辨率存储
+        // （坐标已除以 `octave_scale`）。采样半径与高斯权重必须同样换算到金字塔坐标，
+        // 否则高层 octave 的窗口会被放大 `octave_scale` 倍。
+        let pyr_scale = scale / octave_scale;
+        let sigma = gaussian_sigma_factor * pyr_scale;
         let radius = i32::cast_from((3.0 * sigma).round());
 
         let mut b = 0;
@@ -225,13 +229,20 @@ fn compute_descriptor(
         let scale_idx = usize::cast_from(kp_scale_idx[kp_idx]);
         let orientation = kp_orientation[kp_idx];
 
-        let descriptor_size = 16.0 * scale;
-        let cell_size = descriptor_size / f32::cast_from(descriptor_width);
+        // 描述符窗口以关键点尺度为单位，采样落在金字塔坐标上，先把原图 sigma
+        // 换算到金字塔坐标。对齐 OpenCV：每个 cell 宽 hist_width =
+        // SIFT_DESCR_SCL_FCTR * scl = 3σ（原实现 16σ 窗口 / 4σ cell 比 OpenCV 大 33%）。
+        let pyr_scale = scale / octave_scale;
+        let hist_width = 3.0 * pyr_scale;
         let cos_theta = orientation.cos();
         let sin_theta = orientation.sin();
-        let sigma = 0.5 * descriptor_size;
+        // 高斯权重 σ_w = 2*hist_width（OpenCV exp_scale = -1/(d*d*0.5)，旋转保距）。
+        let sigma = 2.0 * hist_width;
         let invsig2 = 1.0 / (2.0 * sigma * sigma);
-        let half_size = i32::cast_from((descriptor_size / 2.0).ceil());
+        // 采样半径覆盖旋转后窗口对角线（OpenCV: hist_width*sqrt(2)*(d+1)*0.5）。
+        let radius = i32::cast_from(
+            (hist_width * 1.414_213_5 * (f32::cast_from(descriptor_width) + 1.0) * 0.5).round(),
+        );
 
         let base = scale_idx * scale_stride;
         let width_f = f32::cast_from(width);
@@ -248,18 +259,21 @@ fn compute_descriptor(
             d += 1;
         }
 
-        let mut dy = -half_size;
-        while dy < half_size {
-            let mut dx = -half_size;
-            while dx < half_size {
+        let mut dy = -radius;
+        while dy <= radius {
+            let mut dx = -radius;
+            while dx <= radius {
                 let rx = f32::cast_from(dx);
                 let ry = f32::cast_from(dy);
 
-                let tr_x = cos_theta * rx - sin_theta * ry;
-                let tr_y = sin_theta * rx + cos_theta * ry;
+                // 与 OpenCV 一致：在「未旋转」的采样网格上取梯度，bin 坐标旋转 -θ
+                // 到主方向（canonical 帧）。采样位置不能再旋转，否则采样点与 bin
+                // 都转 -θ 会双重旋转，窗口方向反而转错。
+                let tr_x = cos_theta * rx + sin_theta * ry;
+                let tr_y = -sin_theta * rx + cos_theta * ry;
 
-                let sx = x / octave_scale + tr_x;
-                let sy = y / octave_scale + tr_y;
+                let sx = x / octave_scale + rx;
+                let sy = y / octave_scale + ry;
 
                 if sx >= 1.0 && sy >= 1.0 && sx < width_f - 1.0 && sy < height_f - 1.0 {
                     let win_weight = (-f32::cast_from(dx * dx + dy * dy) * invsig2).exp();
@@ -272,14 +286,37 @@ fn compute_descriptor(
                         let yf = sy - f32::cast_from(yi);
 
                         let idx00 = base + yi * width + xi;
-                        let mag_interp = magnitudes[idx00] * (1.0 - xf) * (1.0 - yf)
-                            + magnitudes[idx00 + 1] * xf * (1.0 - yf)
-                            + magnitudes[idx00 + width] * (1.0 - xf) * yf
-                            + magnitudes[idx00 + width + 1] * xf * yf;
-                        let ori_interp = orientations[idx00] * (1.0 - xf) * (1.0 - yf)
-                            + orientations[idx00 + 1] * xf * (1.0 - yf)
-                            + orientations[idx00 + width] * (1.0 - xf) * yf
-                            + orientations[idx00 + width + 1] * xf * yf;
+                        let idx01 = idx00 + 1;
+                        let idx10 = idx00 + width;
+                        let idx11 = idx00 + width + 1;
+
+                        let w00 = (1.0 - xf) * (1.0 - yf);
+                        let w01 = xf * (1.0 - yf);
+                        let w10 = (1.0 - xf) * yf;
+                        let w11 = xf * yf;
+
+                        // 以梯度向量 (dx,dy) 而非角度做双线性插值：角度直接插值在
+                        // 0/2π 环绕处（如 350° 与 10°）会得到相反方向，与 OpenCV
+                        // 插值梯度分量后再求模长/方向的做法一致。
+                        let o00 = orientations[idx00];
+                        let o01 = orientations[idx01];
+                        let o10 = orientations[idx10];
+                        let o11 = orientations[idx11];
+
+                        let dx_interp = magnitudes[idx00] * o00.cos() * w00
+                            + magnitudes[idx01] * o01.cos() * w01
+                            + magnitudes[idx10] * o10.cos() * w10
+                            + magnitudes[idx11] * o11.cos() * w11;
+                        let dy_interp = magnitudes[idx00] * o00.sin() * w00
+                            + magnitudes[idx01] * o01.sin() * w01
+                            + magnitudes[idx10] * o10.sin() * w10
+                            + magnitudes[idx11] * o11.sin() * w11;
+
+                        let mag_interp = (dx_interp * dx_interp + dy_interp * dy_interp).sqrt();
+                        let mut ori_interp = dy_interp.atan2(dx_interp);
+                        if ori_interp < 0.0 {
+                            ori_interp += 6.283_185_3;
+                        }
 
                         let mut angle_diff = ori_interp - orientation;
                         if angle_diff < 0.0 {
@@ -288,8 +325,8 @@ fn compute_descriptor(
 
                         let ori_bin = angle_diff * descriptor_num_bins_f / 6.283_185_3;
 
-                        let cx = (tr_x + descriptor_size / 2.0) / cell_size;
-                        let cy = (tr_y + descriptor_size / 2.0) / cell_size;
+                        let cx = tr_x / hist_width + descriptor_width_f / 2.0 - 0.5;
+                        let cy = tr_y / hist_width + descriptor_width_f / 2.0 - 0.5;
 
                         if cx >= -1.0
                             && cx < descriptor_width_f

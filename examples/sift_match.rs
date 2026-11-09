@@ -224,6 +224,22 @@ fn main() {
     let rgb_original = original_img.to_rgb8();
     let matched_img = visualize_matches(&rgb_original, &rgb_rotated, &matches);
 
-    // 保存结果
-    matched_img.save("./examples/sift_matches.jpg").unwrap();
-    println!("Matches visualization saved to ./examples/sift_matches.jpg");}
+    // 在窗口中显示匹配结果（按 Esc 或关闭窗口退出）
+    let (mw, mh) = (matched_img.width() as usize, matched_img.height() as usize);
+    let buffer: Vec<u32> = matched_img
+        .pixels()
+        .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32))
+        .collect();
+
+    let title = format!(
+        "SIFT 匹配（旋转 {:.1}°）—— {} 对匹配，Esc 关闭",
+        angle_45.to_degrees(),
+        matches.len()
+    );
+    let mut window = minifb::Window::new(&title, mw, mh, minifb::WindowOptions::default())
+        .expect("创建窗口失败");
+    window.limit_update_rate(Some(std::time::Duration::from_micros(16_600)));
+    while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+        window.update_with_buffer(&buffer, mw, mh).unwrap();
+    }
+}

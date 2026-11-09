@@ -35,7 +35,7 @@ impl Default for SiftParams {
             octave_resolution: 3,
             peak_threshold: 0.04,
             edge_threshold: 10.0,
-            normalization: Normalization::L1,
+            normalization: Normalization::L2,
         }
     }
 }
@@ -342,7 +342,12 @@ pub(crate) fn detect<R: Runtime>(
 
         // GPU 全链路：高斯金字塔 → DoG → 极值检测（输出标记数组）
         let gaussian = compute_gaussian_pyramid(client, sigma, &current_img, n_g, h, w, num_scales);
-        let flags = find_extrema(client, &gaussian, w, h, n_dog, params.peak_threshold);
+        // 与 OpenCV 一致：`peak_threshold` 是归一化对比度阈值（对应 OpenCV 的
+        // `contrastThreshold`），而 DoG 值域为 [0,255]。初始极值阈值取
+        // `0.5 * peak_threshold / octave_resolution * 255`，避免把 octave 0 里
+        // 海量的低对比度细纹理极值全部保留下来。
+        let extrema_threshold = 0.5 * params.peak_threshold / num_scales as f32 * 255.0;
+        let flags = find_extrema(client, &gaussian, w, h, n_dog, extrema_threshold);
 
         // 批量读回：完整高斯金字塔 + 极值标记（整块对齐，避免非对齐子句柄）
         let bytes_vec = client.read(vec![gaussian.clone(), flags]);
@@ -662,7 +667,8 @@ fn resize_bilinear_grayscale(
 ///
 /// # Returns
 ///
-/// 收敛时返回 `(dx, dy, ds, dog_value)`，否则返回 `None`。
+/// 收敛时返回 `(final_x, final_y, final_s, dog_value)`（精化后的绝对坐标/尺度），
+/// 否则返回 `None`。
 fn refine_extremum(
     ctx: &ExtremaContext,
     x: usize,
@@ -673,56 +679,56 @@ fn refine_extremum(
     const MAX_ITER: usize = 5;
     const CONVERGE_THRESH: f32 = 0.5;
 
-    let mut offset = Vector3::new(0., 0., 0.);
     let (width, height) = (ctx.current.shape()[1], ctx.current.shape()[0]);
 
-    let mut x_float = x as f32;
-    let mut y_float = y as f32;
-    let mut s_float = scale as f32;
+    // 当前整数坐标（牛顿迭代未收敛时会"re-center"到相邻整数，与 OpenCV 一致）。
+    // 与旧实现不同，这里用四舍五入而不是截断：截断会让偏移量 >0.5 的点永远
+    // 停在原整数位置上反复算同一个步长，最终在 5 次迭代后返回 None 被丢弃。
+    let mut x_int = x as i32;
+    let mut y_int = y as i32;
+    let mut s_int = scale as i32;
 
     for _iter in 0..MAX_ITER {
-        let x_int = x_float as usize;
-        let y_int = y_float as usize;
-        let s_int = s_float as usize;
-
         // 检查边界 - DOG金字塔的边界检查
         if x_int < 1
-            || x_int >= width - 1
+            || x_int >= width as i32 - 1
             || y_int < 1
-            || y_int >= height - 1
+            || y_int >= height as i32 - 1
             || s_int < 1
-            || s_int >= dog_scales - 1
+            || s_int >= dog_scales as i32 - 1
         {
             return None;
         }
 
+        let xu = x_int as usize;
+        let yu = y_int as usize;
+
         // 计算一阶导数（梯度）
-        let dx = (ctx.current[[y_int, x_int + 1]] - ctx.current[[y_int, x_int - 1]]) * 0.5;
-        let dy = (ctx.current[[y_int + 1, x_int]] - ctx.current[[y_int - 1, x_int]]) * 0.5;
-        let ds = (ctx.next[[y_int, x_int]] - ctx.prev[[y_int, x_int]]) * 0.5;
+        let dx = (ctx.current[[yu, xu + 1]] - ctx.current[[yu, xu - 1]]) * 0.5;
+        let dy = (ctx.current[[yu + 1, xu]] - ctx.current[[yu - 1, xu]]) * 0.5;
+        let ds = (ctx.next[[yu, xu]] - ctx.prev[[yu, xu]]) * 0.5;
 
         // 计算二阶导数（Hessian矩阵）
-        let dxx = ctx.current[[y_int, x_int + 1]] - 2.0 * ctx.current[[y_int, x_int]]
-            + ctx.current[[y_int, x_int - 1]];
-        let dyy = ctx.current[[y_int + 1, x_int]] - 2.0 * ctx.current[[y_int, x_int]]
-            + ctx.current[[y_int - 1, x_int]];
-        let dss =
-            ctx.next[[y_int, x_int]] - 2.0 * ctx.current[[y_int, x_int]] + ctx.prev[[y_int, x_int]];
+        let dxx = ctx.current[[yu, xu + 1]] - 2.0 * ctx.current[[yu, xu]]
+            + ctx.current[[yu, xu - 1]];
+        let dyy = ctx.current[[yu + 1, xu]] - 2.0 * ctx.current[[yu, xu]]
+            + ctx.current[[yu - 1, xu]];
+        let dss = ctx.next[[yu, xu]] - 2.0 * ctx.current[[yu, xu]] + ctx.prev[[yu, xu]];
 
-        let dxy = (ctx.current[[y_int + 1, x_int + 1]]
-            - ctx.current[[y_int + 1, x_int - 1]]
-            - ctx.current[[y_int - 1, x_int + 1]]
-            + ctx.current[[y_int - 1, x_int - 1]])
+        let dxy = (ctx.current[[yu + 1, xu + 1]]
+            - ctx.current[[yu + 1, xu - 1]]
+            - ctx.current[[yu - 1, xu + 1]]
+            + ctx.current[[yu - 1, xu - 1]])
             * 0.25;
-        let dxs = (ctx.next[[y_int, x_int + 1]]
-            - ctx.next[[y_int, x_int - 1]]
-            - ctx.prev[[y_int, x_int + 1]]
-            + ctx.prev[[y_int, x_int - 1]])
+        let dxs = (ctx.next[[yu, xu + 1]]
+            - ctx.next[[yu, xu - 1]]
+            - ctx.prev[[yu, xu + 1]]
+            + ctx.prev[[yu, xu - 1]])
             * 0.25;
-        let dys = (ctx.next[[y_int + 1, x_int]]
-            - ctx.next[[y_int - 1, x_int]]
-            - ctx.prev[[y_int + 1, x_int]]
-            + ctx.prev[[y_int - 1, x_int]])
+        let dys = (ctx.next[[yu + 1, xu]]
+            - ctx.next[[yu - 1, xu]]
+            - ctx.prev[[yu + 1, xu]]
+            + ctx.prev[[yu - 1, xu]])
             * 0.25;
 
         let hessian = Matrix3::new(dxx, dxy, dxs, dxy, dyy, dys, dxs, dys, dss);
@@ -735,35 +741,38 @@ fn refine_extremum(
         let grad = Vector3::new(dx, dy, ds);
         let delta = lu.solve(&(-grad)).unwrap();
 
-        // 更新偏移量
-        offset += delta;
+        // 收敛判断（与 OpenCV 一致：各分量分别 < 0.5，而不是向量模长 < 0.5；
+        // 模长判据会把 dx=0.4,dy=0.4,ds=0.4 这类合法点误判为不收敛而丢弃）。
+        if delta[0].abs() < CONVERGE_THRESH
+            && delta[1].abs() < CONVERGE_THRESH
+            && delta[2].abs() < CONVERGE_THRESH
+        {
+            let final_x = x_int as f32 + delta[0];
+            let final_y = y_int as f32 + delta[1];
+            let final_s = s_int as f32 + delta[2];
 
-        // 更新坐标
-        x_float += delta[0];
-        y_float += delta[1];
-        s_float += delta[2];
-
-        // 收敛判断
-        if delta.norm() < CONVERGE_THRESH {
             // 检查最终位置是否在边界内
-            if x_float < 0.0
-                || x_float >= (width as f32)
-                || y_float < 0.0
-                || y_float >= (height as f32)
-                || s_float < 0.0
-                || s_float >= dog_scales as f32
+            if final_x < 0.0
+                || final_x >= width as f32
+                || final_y < 0.0
+                || final_y >= height as f32
+                || final_s < 0.0
+                || final_s >= dog_scales as f32
             {
                 return None;
             }
 
-            // 计算在极值点的函数值（使用完整的二阶泰勒展开）
-            let dog_value = ctx.current[[y_int, x_int]]
-                + grad.dot(&offset)
-                + 0.5 * (offset.transpose() * hessian * offset)[0];
+            // 极值点处的 DoG 值：一阶泰勒校正（与 OpenCV 的 contr 计算一致）。
+            let dog_value = ctx.current[[yu, xu]] + 0.5 * grad.dot(&delta);
 
-            // 返回相对于当前点的偏移量
-            return Some((delta[0], delta[1], delta[2], dog_value));
+            // 返回精化后的绝对坐标与尺度
+            return Some((final_x, final_y, final_s, dog_value));
         }
+
+        // 未收敛：re-center 到相邻整数位置（四舍五入，与 OpenCV 一致）
+        x_int += delta[0].round() as i32;
+        y_int += delta[1].round() as i32;
+        s_int += delta[2].round() as i32;
     }
     None
 }
@@ -830,12 +839,13 @@ fn refine_candidates(
             next: dog.index_axis(Axis(0), scale + 1),
         };
 
-        if let Some((dx, dy, _ds, value)) = refine_extremum(&ctx, x, y, scale, dog_scales) {
-            // 检查偏移量是否过大（表示插值不可靠）
-            if dx.abs() >= 1.0 || dy.abs() >= 1.0 || _ds.abs() >= 1.0 {
-                continue;
-            }
-            if value.abs() < params.peak_threshold {
+        if let Some((refined_x, refined_y, refined_s, value)) =
+            refine_extremum(&ctx, x, y, scale, dog_scales)
+        {
+            // 与 OpenCV 一致：`|DoG| / 255 * octave_resolution >= peak_threshold`。
+            // 归一化到对比度后再判阈，保证各 octave 用同一把尺子，octave 0 的
+            // 低对比度细纹理会被滤掉，大尺度结构特征（道路/田埂等）得以保留。
+            if value.abs() * num_scales as f32 / 255.0 < params.peak_threshold {
                 continue;
             }
 
@@ -844,11 +854,9 @@ fn refine_candidates(
                 continue;
             }
 
-            // 计算实际尺度值：sigma * 2^(first_octave + octave + (scale + ds)/octave_resolution)
+            // 计算实际尺度值：sigma * 2^(first_octave + octave + refined_s/octave_resolution)
             let scale_factor = 2.0_f32.powf(
-                params.first_octave as f32
-                    + octave as f32
-                    + (scale as f32 + _ds) / params.octave_resolution as f32,
+                params.first_octave as f32 + octave as f32 + refined_s / params.octave_resolution as f32,
             );
             let actual_scale = sigma * scale_factor;
 
@@ -858,14 +866,15 @@ fn refine_candidates(
             keypoints.push((
                 value.abs(),
                 KeyPoint {
-                    x: (x as f32 + dx) * coord_scale,
-                    y: (y as f32 + dy) * coord_scale,
+                    x: refined_x * coord_scale,
+                    y: refined_y * coord_scale,
                     scale: actual_scale,
                     octave,
                     first_octave: params.first_octave,
                     orientation: 0.0,
-                    // DoG 尺度 `scale` 对应高斯层 `scale`（dog[s] = gaussian[s+1] - gaussian[s]）
-                    scale_idx: scale,
+                    // 高斯层索引 = 精化后尺度的最近整数层
+                    // （dog[s] = gaussian[s+1] - gaussian[s]，与 OpenCV 取整一致）
+                    scale_idx: refined_s.round() as usize,
                 },
             ));
         }
